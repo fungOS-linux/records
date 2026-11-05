@@ -15,10 +15,8 @@ encryption model.
 - macOS Contacts vCard import
 - vCard export
 - list/search/stat/vector/dump/apply
-- SSH-based device sync
-
-The current transport is SSH because it gets real contacts syncing today. The
-store and op format are transport-neutral; Unibus is the next adapter.
+- Unibus device sync with a long-running provider
+- SSH sync as a bootstrap/fallback transport
 
 ## Import the macOS address book
 
@@ -41,15 +39,39 @@ records --root ~/.local/share/fungos/records list \
   --book personal/avery/contacts --search acme --json
 ```
 
-## Sync
+## Unibus sync
 
-On the remote node, install `records` and initialise the same root:
+Run a provider on an always-on node:
 
 ```sh
-records --root ~/.local/share/fungos/records init
+records --root ~/.local/share/fungos/records serve \
+  --config ~/.config/unibus/records-studio.json
 ```
 
-From the source device:
+From the device:
+
+```sh
+records --root ~/.local/share/fungos/records unibus-sync \
+  --book personal/avery/contacts \
+  --config ~/.config/unibus/records-macbook.json \
+  --peer records.studio
+```
+
+Protocol kinds:
+
+```text
+records.sync.pull.v1   consumer -> provider
+records.sync.ops.v1    provider -> consumer
+records.sync.push.v1   consumer -> provider
+records.sync.ack.v1    provider -> consumer
+records.sync.error.v1  provider -> consumer
+```
+
+The provider exchanges vectors, returns ops missing from the caller, and accepts
+ops the caller has that the provider lacks. `op_id` makes re-delivery
+idempotent.
+
+### SSH fallback
 
 ```sh
 records --root ~/.local/share/fungos/records sync \
@@ -57,8 +79,7 @@ records --root ~/.local/share/fungos/records sync \
   --ssh studio
 ```
 
-`sync` exchanges vectors first, then pulls and pushes the missing signed ops.
-It is idempotent: duplicate `op_id`s are ignored.
+Both transports use the same store and op format.
 
 ## Data layout
 
@@ -85,13 +106,15 @@ next design slice; this implementation does not yet expose them.
 
 ## Roadmap
 
-1. Unibus transport adapter (replace SSH).
-2. Encrypted book keys and device wrapping.
-3. `recordsd` native service with Unibus provider/consumer contracts.
-4. Team/company books and explicit share projections.
-5. Calendar adapter with time zones, recurrence, and alarms.
-6. CardDAV/CalDAV front doors.
-7. PostgreSQL 17 backend for always-on nodes.
+1. Encrypted book keys and device wrapping.
+2. Team/company books and explicit share projections.
+3. Calendar adapter with time zones, recurrence, and alarms.
+4. CardDAV/CalDAV front doors.
+5. PostgreSQL 17 backend for always-on nodes.
+6. Records schema packs and Lua policy.
+
+The current Unibus frames are authenticated by producer tokens but are not
+end-to-end encrypted. Do not treat this slice as the final privacy boundary.
 
 ## License
 

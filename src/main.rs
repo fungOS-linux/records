@@ -11,7 +11,9 @@ use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -19,10 +21,18 @@ use clap::{Parser, Subcommand};
 use ical_vcard::{Contentline, Parser as VCardParser};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use unibus::client::{Client, ClientConfig};
+use unibus::{Envelope, Message};
 use uuid::Uuid;
 
 const CONTACT_SCHEMA: &str = "fungos.contacts/contact";
 const CONTACT_VERSION: i64 = 1;
+const PULL_KIND: &str = "records.sync.pull.v1";
+const OPS_KIND: &str = "records.sync.ops.v1";
+const PUSH_KIND: &str = "records.sync.push.v1";
+const ACK_KIND: &str = "records.sync.ack.v1";
+const ERROR_KIND: &str = "records.sync.error.v1";
+const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(version, about = "Local-first fungOS records")]
@@ -85,6 +95,18 @@ enum Cmd {
         remote_binary: String,
         #[arg(long, default_value = "~/.local/share/fungos/records")]
         remote_root: String,
+    },
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    UnibusSync {
+        #[arg(long)]
+        book: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        peer: String,
     },
 }
 
@@ -195,6 +217,12 @@ fn run() -> anyhow::Result<()> {
                 vector_string(&store.vector(&book)?),
                 vector_string(&remote_vector)
             );
+        }
+        Cmd::Serve { config } => {
+            serve_unibus(&mut store, &config)?;
+        }
+        Cmd::UnibusSync { book, config, peer } => {
+            sync_unibus(&mut store, &book, &config, &peer)?;
         }
     }
     Ok(())
@@ -309,7 +337,7 @@ impl Remote {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Op {
     op_id: String,
     book_id: String,
@@ -812,6 +840,268 @@ fn expand_home_string(value: &str) -> String {
         format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest)
     } else {
         value.into()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PullRequest {
+    request_id: String,
+    book_id: String,
+    vector: Vector,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpsResponse {
+    request_id: String,
+    book_id: String,
+    ops: Vec<Op>,
+    vector: Vector,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PushRequest {
+    request_id: String,
+    book_id: String,
+    ops: Vec<Op>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AckResponse {
+    request_id: String,
+    book_id: String,
+    applied: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncError {
+    request_id: String,
+    book_id: String,
+    code: String,
+    detail: String,
+}
+
+fn load_client(path: &Path) -> anyhow::Result<Arc<Client>> {
+    let config: ClientConfig = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .context("parse Unibus client config")?;
+    Ok(Arc::new(
+        Client::connect(config).context("connect Unibus hub")?,
+    ))
+}
+
+fn serve_unibus(store: &mut Store, config: &Path) -> anyhow::Result<()> {
+    let client = load_client(config)?;
+    eprintln!("records: serving as {}", client.config().producer_id);
+    loop {
+        let Some((envelope, payload)) = client
+            .try_read()
+            .map_err(|error| anyhow!("read Unibus frame: {error:#}"))?
+        else {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        if !payload.is_empty() {
+            continue;
+        }
+        match envelope.message.kind.as_str() {
+            PULL_KIND => {
+                let Ok(request) =
+                    serde_json::from_value::<PullRequest>(envelope.message.body.clone().into())
+                else {
+                    eprintln!("records: invalid pull request");
+                    continue;
+                };
+                match store.dump(&request.book_id, Some(&request.vector)) {
+                    Ok(ops) => {
+                        let response = OpsResponse {
+                            request_id: request.request_id.clone(),
+                            book_id: request.book_id.clone(),
+                            vector: store.vector(&request.book_id)?,
+                            ops,
+                        };
+                        reply(&client, &envelope, OPS_KIND, &response)?;
+                    }
+                    Err(error) => reply_error(
+                        &client,
+                        &envelope,
+                        &request.request_id,
+                        &request.book_id,
+                        "pull_failed",
+                        &error.to_string(),
+                    )?,
+                }
+            }
+            PUSH_KIND => {
+                let Ok(request) =
+                    serde_json::from_value::<PushRequest>(envelope.message.body.clone().into())
+                else {
+                    eprintln!("records: invalid push request");
+                    continue;
+                };
+                let mut applied = 0;
+                let mut failure = None;
+                for op in &request.ops {
+                    match store.apply_op(op) {
+                        Ok(()) => applied += 1,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if let Some(error) = failure {
+                    reply_error(
+                        &client,
+                        &envelope,
+                        &request.request_id,
+                        &request.book_id,
+                        "push_failed",
+                        &error.to_string(),
+                    )?;
+                } else {
+                    let response = AckResponse {
+                        request_id: request.request_id,
+                        book_id: request.book_id,
+                        applied,
+                    };
+                    reply(&client, &envelope, ACK_KIND, &response)?;
+                }
+            }
+            ERROR_KIND => {}
+            _ => {}
+        }
+    }
+}
+
+fn reply<T: Serialize>(
+    client: &Client,
+    request: &Envelope,
+    kind: &str,
+    body: &T,
+) -> anyhow::Result<()> {
+    let reply = client
+        .envelope(
+            Some(&request.producer_id),
+            Message::new(kind, serde_json::to_value(body)?),
+        )
+        .context("build reply")?;
+    client.send(&reply, &[]).context("send reply")
+}
+
+fn reply_error(
+    client: &Client,
+    request: &Envelope,
+    request_id: &str,
+    book_id: &str,
+    code: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    reply(
+        client,
+        request,
+        ERROR_KIND,
+        &SyncError {
+            request_id: request_id.into(),
+            book_id: book_id.into(),
+            code: code.into(),
+            detail: detail.into(),
+        },
+    )
+}
+
+fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyhow::Result<()> {
+    let client = load_client(config)?;
+    let request_id = Uuid::new_v4().to_string();
+    let pull = PullRequest {
+        request_id: request_id.clone(),
+        book_id: book.into(),
+        vector: store.vector(book)?,
+    };
+    send_request(&client, peer, PULL_KIND, &pull)?;
+    let response: OpsResponse = wait_for(&client, OPS_KIND, &request_id)?;
+    if response.book_id != book {
+        bail!("peer answered for {}", response.book_id);
+    }
+    let mut pulled = 0;
+    for op in &response.ops {
+        store.apply_op(op)?;
+        pulled += 1;
+    }
+    let push_ops = store.dump(book, Some(&response.vector))?;
+    let pushed = push_ops.len();
+    if !push_ops.is_empty() {
+        let push = PushRequest {
+            request_id: request_id.clone(),
+            book_id: book.into(),
+            ops: push_ops,
+        };
+        send_request(&client, peer, PUSH_KIND, &push)?;
+        let ack: AckResponse = wait_for(&client, ACK_KIND, &request_id)?;
+        if ack.book_id != book {
+            bail!("peer acknowledged {}", ack.book_id);
+        }
+    }
+    println!(
+        "unibus sync {book}: pulled {pulled}, pushed {pushed} (local {} remote {})",
+        vector_string(&store.vector(book)?),
+        vector_string(&response.vector)
+    );
+    Ok(())
+}
+
+fn send_request<T: Serialize>(
+    client: &Client,
+    peer: &str,
+    kind: &str,
+    body: &T,
+) -> anyhow::Result<()> {
+    let envelope = client
+        .envelope(Some(peer), Message::new(kind, serde_json::to_value(body)?))
+        .context("build Unibus request")?;
+    client.send(&envelope, &[]).context("send Unibus request")
+}
+
+fn wait_for<T: for<'de> Deserialize<'de>>(
+    client: &Client,
+    kind: &str,
+    request_id: &str,
+) -> anyhow::Result<T> {
+    let deadline = Instant::now() + SYNC_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for {kind}");
+        }
+        let Some((envelope, payload)) = client
+            .try_read()
+            .map_err(|error| anyhow!("read Unibus frame: {error:#}"))?
+        else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        if !payload.is_empty() {
+            continue;
+        }
+        if envelope.message.kind == ERROR_KIND {
+            let error: SyncError =
+                serde_json::from_value(envelope.message.body.into()).context("parse sync error")?;
+            if error.request_id == request_id {
+                bail!("{}: {} ({})", error.code, error.detail, error.book_id);
+            }
+            continue;
+        }
+        if envelope.message.kind != kind {
+            continue;
+        }
+        let body: serde_json::Value = envelope.message.body.into();
+        let response_request = body
+            .get("request_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if response_request != request_id {
+            continue;
+        }
+        return serde_json::from_value(body).context("decode Unibus response");
     }
 }
 
