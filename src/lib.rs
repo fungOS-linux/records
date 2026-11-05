@@ -19,7 +19,7 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use clap::{Parser, Subcommand};
 use ical_vcard::{Contentline, Parser as VCardParser};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use unibus::client::{Client, ClientConfig};
 use unibus::{Envelope, Message, PeerSession};
@@ -425,6 +425,20 @@ pub struct Record {
     pub updated_hlc: u64,
     pub deleted: bool,
     pub origin: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+/// One page of a cross-namespace query, newest first.
+pub struct QueryPage {
+    pub records: Vec<Record>,
+    pub next: Option<String>,
+}
+
+/// Cheap watermark used by host-side live refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watermark {
+    pub revision: u64,
+    pub records: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1182,6 +1196,98 @@ impl Store {
         Ok(records)
     }
 
+    /// Search one or more book namespaces in one page, newest first.
+    ///
+    /// This is the startup query for Spores that do not know which book will
+    /// answer: inbox, contacts, calendar, and Marbles can all be asked at once.
+    /// The caller supplies the namespaces it was granted; the host does not
+    /// discover or guess books here.
+    pub fn query_records(
+        &self,
+        namespaces: &[String],
+        text: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<QueryPage> {
+        if namespaces.is_empty() || namespaces.len() > 64 {
+            bail!("query requires 1-64 namespaces");
+        }
+        if limit == 0 || limit > 512 {
+            bail!("query limit must be 1-512");
+        }
+        for namespace in namespaces {
+            if namespace.is_empty()
+                || namespace.len() > 256
+                || namespace.starts_with('/')
+                || namespace
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                bail!("invalid records namespace");
+            }
+        }
+
+        let mut sql = String::from(
+            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
+             FROM records WHERE deleted=0",
+        );
+        let placeholders = std::iter::repeat_n("?", namespaces.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND book_id IN ({placeholders})"));
+        let mut values: Vec<SqlValue> = namespaces.iter().cloned().map(SqlValue::Text).collect();
+
+        let needle = text.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(needle) = needle {
+            sql.push_str(" AND fields LIKE ? ESCAPE '\\'");
+            values.push(SqlValue::Text(format!("%{}%", escape_like(needle))));
+        }
+        if let Some(cursor) = cursor {
+            let (revision, book, entity) = parse_query_cursor(cursor)?;
+            sql.push_str(
+                " AND (updated_hlc < ? OR (updated_hlc = ? AND (book_id > ? OR (book_id = ? AND entity_id > ?))))",
+            );
+            values.push(SqlValue::Integer(revision as i64));
+            values.push(SqlValue::Integer(revision as i64));
+            values.push(SqlValue::Text(book.clone()));
+            values.push(SqlValue::Text(book));
+            values.push(SqlValue::Text(entity));
+        }
+        sql.push_str(" ORDER BY updated_hlc DESC, book_id ASC, entity_id ASC LIMIT ?");
+        values.push(SqlValue::Integer(limit as i64 + 1));
+
+        let mut statement = self.db.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values.iter()), row_to_record)?;
+        let mut records = rows.collect::<Result<Vec<_>, _>>()?;
+        let next = if records.len() > limit {
+            records.truncate(limit);
+            records.last().map(query_cursor)
+        } else {
+            None
+        };
+        Ok(QueryPage { records, next })
+    }
+
+    /// The current maximum revision and live record count for one namespace.
+    pub fn watermark(&self, namespace: &str) -> anyhow::Result<Watermark> {
+        if namespace.is_empty()
+            || namespace.len() > 256
+            || namespace.starts_with('/')
+            || namespace
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            bail!("invalid records namespace");
+        }
+        let (revision, records) = self.db.query_row(
+            "SELECT COALESCE(MAX(updated_hlc),0),COUNT(*)
+             FROM records WHERE book_id=?1 AND deleted=0",
+            params![namespace],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )?;
+        Ok(Watermark { revision, records })
+    }
+
     pub fn get(&self, book: &str, id: &str) -> anyhow::Result<Record> {
         self.db
             .query_row(
@@ -1415,6 +1521,31 @@ fn parse_cursor(cursor: &str) -> anyhow::Result<(u64, String)> {
         hlc.parse().context("invalid records cursor hlc")?,
         entity.into(),
     ))
+}
+
+fn parse_query_cursor(cursor: &str) -> anyhow::Result<(u64, String, String)> {
+    let mut parts = cursor.splitn(3, ':');
+    let revision = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid query cursor"))?
+        .parse()
+        .context("invalid query cursor revision")?;
+    let book = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("invalid query cursor namespace"))?;
+    let entity = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("invalid query cursor entity"))?;
+    Ok((revision, book.into(), entity.into()))
+}
+
+fn query_cursor(record: &Record) -> String {
+    format!(
+        "{}:{}:{}",
+        record.updated_hlc, record.book_id, record.entity_id
+    )
 }
 
 fn now_ms() -> u64 {
