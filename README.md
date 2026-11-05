@@ -15,6 +15,8 @@ encryption model.
 - macOS Contacts vCard import
 - vCard export
 - list/search/stat/vector/dump/apply
+- generic schema-tagged entries plus the built-in contacts schema
+- materialized changes and revision/origin merge
 - Unibus device sync with a long-running provider
 - SSH sync as a bootstrap/fallback transport
 
@@ -92,6 +94,31 @@ Both transports use the same store and op format.
 
 The SQLite database is a local index and projection. The durable sync data is
 the op log in `ops`, scoped by `book_id`.
+
+## Library and Spore host
+
+The store is also a library:
+
+```rust
+use fungos_records::{Store, RecordEntry};
+
+let mut store = Store::open(root, &root.join("device_id"))?;
+store.put_record(book, id, "fungos.mail/message@1", 1, fields)?;
+
+store.apply_entry(book, RecordEntry {
+    entity_id: id,
+    schema_id: "fungos.mail/message@1",
+    schema_version: 1,
+    fields,
+    deleted: false,
+    revision: remote_hlc,
+    origin: remote_device,
+})?;
+```
+
+`Store::scan_changes(book, cursor, limit)` returns a materialized change feed
+including tombstones. `crates/soil-records-host` in Soil exposes this through
+`soil:records`; `crates/soil-sdk-records` is the guest side.
 
 ## Book and schema namespacing
 

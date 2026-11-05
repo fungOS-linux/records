@@ -352,6 +352,7 @@ pub struct Record {
     pub fields: serde_json::Value,
     pub updated_hlc: u64,
     pub deleted: bool,
+    pub origin: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -375,6 +376,17 @@ pub struct Contact {
 pub struct LabeledValue {
     label: String,
     value: String,
+}
+
+/// One materialized entry accepted from a peer.
+pub struct RecordEntry<'a> {
+    pub entity_id: &'a str,
+    pub schema_id: &'a str,
+    pub schema_version: i64,
+    pub fields: serde_json::Value,
+    pub deleted: bool,
+    pub revision: u64,
+    pub origin: &'a str,
 }
 
 pub struct Store {
@@ -411,6 +423,7 @@ impl Store {
                fields TEXT NOT NULL,
                updated_hlc INTEGER NOT NULL,
                deleted INTEGER NOT NULL DEFAULT 0,
+               origin TEXT NOT NULL DEFAULT '',
                PRIMARY KEY(book_id, entity_id)
              );
              CREATE INDEX IF NOT EXISTS records_book ON records(book_id);
@@ -434,6 +447,17 @@ impl Store {
                 [],
             )?;
         }
+        let has_origin: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('records') WHERE name='origin')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_origin {
+            db.execute(
+                "ALTER TABLE records ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         let store = Self {
             root: root.to_path_buf(),
             db,
@@ -447,11 +471,15 @@ impl Store {
     }
 
     pub fn next_seq(&self, book: &str) -> anyhow::Result<u64> {
+        self.next_seq_for(book, &self.device_id)
+    }
+
+    fn next_seq_for(&self, book: &str, device_id: &str) -> anyhow::Result<u64> {
         let current: Option<i64> = self
             .db
             .query_row(
                 "SELECT seq FROM ops WHERE book_id=?1 AND device_id=?2 ORDER BY seq DESC LIMIT 1",
-                params![book, self.device_id],
+                params![book, device_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -465,19 +493,70 @@ impl Store {
         kind: &str,
         body: serde_json::Value,
     ) -> anyhow::Result<Op> {
-        let seq = self.next_seq(book)?;
-        let hlc = now_ms();
-        let op = Op {
+        let device_id = self.device_id.clone();
+        self.append_as(book, &device_id, entity_id, kind, body, now_ms())
+    }
+
+    /// Create or replace a generic schema-tagged record.
+    pub fn put_record(
+        &mut self,
+        book: &str,
+        entity_id: &str,
+        schema_id: &str,
+        schema_version: i64,
+        fields: serde_json::Value,
+    ) -> anyhow::Result<Op> {
+        self.append(
+            book,
+            entity_id,
+            "record.put",
+            serde_json::json!({
+                "schema_id": schema_id,
+                "schema_version": schema_version,
+                "fields": fields,
+            }),
+        )
+    }
+
+    /// Write a generic tombstone.
+    pub fn delete_record(
+        &mut self,
+        book: &str,
+        entity_id: &str,
+        schema_id: &str,
+        schema_version: i64,
+    ) -> anyhow::Result<Op> {
+        self.append(
+            book,
+            entity_id,
+            "record.delete",
+            serde_json::json!({
+                "schema_id": schema_id,
+                "schema_version": schema_version,
+            }),
+        )
+    }
+
+    fn append_as(
+        &mut self,
+        book: &str,
+        device_id: &str,
+        entity_id: &str,
+        kind: &str,
+        body: serde_json::Value,
+        hlc: u64,
+    ) -> anyhow::Result<Op> {
+        let seq = self.next_seq_for(book, device_id)?;
+        let mut op = Op {
             op_id: String::new(),
             book_id: book.into(),
-            device_id: self.device_id.clone(),
+            device_id: device_id.into(),
             seq,
             hlc,
             kind: kind.into(),
             entity_id: entity_id.into(),
             body,
         };
-        let mut op = op;
         op.op_id = op_id(&op)?;
         apply_projection(&self.db, &op)?;
         let body = serde_json::to_string(&op.body)?;
@@ -496,6 +575,82 @@ impl Store {
             ],
         )?;
         Ok(op)
+    }
+
+    /// Apply one materialized remote entry with last-writer-wins semantics.
+    ///
+    /// The entry revision is the remote HLC; equal revisions are ordered by
+    /// origin. Returns `false` when the entry was already present or lost.
+    pub fn apply_entry(&mut self, book: &str, entry: RecordEntry<'_>) -> anyhow::Result<bool> {
+        let origin = if entry.origin.is_empty() {
+            "remote"
+        } else {
+            entry.origin
+        };
+        if let Some(current) = self.get_optional(book, entry.entity_id)? {
+            if entry.revision < current.updated_hlc {
+                return Ok(false);
+            }
+            if entry.revision == current.updated_hlc && origin <= current.origin.as_str() {
+                return Ok(false);
+            }
+        }
+        let body = if entry.deleted {
+            serde_json::json!({
+                "schema_id": entry.schema_id,
+                "schema_version": entry.schema_version,
+            })
+        } else {
+            serde_json::json!({
+                "schema_id": entry.schema_id,
+                "schema_version": entry.schema_version,
+                "fields": entry.fields,
+            })
+        };
+        let kind = if entry.deleted {
+            "record.delete"
+        } else {
+            "record.put"
+        };
+        self.append_as(book, origin, entry.entity_id, kind, body, entry.revision)?;
+        Ok(true)
+    }
+
+    /// Materialized change feed, including tombstones, ordered by
+    /// `(updated_hlc, entity_id)`. The cursor is the last returned pair.
+    pub fn scan_changes(
+        &self,
+        book: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Record>> {
+        let (hlc, entity) = cursor
+            .map(parse_cursor)
+            .transpose()?
+            .unwrap_or((0, String::new()));
+        let mut statement = self.db.prepare(
+            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
+             FROM records
+             WHERE book_id=?1 AND (updated_hlc > ?2 OR (updated_hlc = ?2 AND entity_id > ?3))
+             ORDER BY updated_hlc, entity_id LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![book, hlc as i64, entity, limit as i64],
+            row_to_record,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn get_optional(&self, book: &str, id: &str) -> anyhow::Result<Option<Record>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
+                 FROM records WHERE book_id=?1 AND entity_id=?2",
+                params![book, id],
+                row_to_record,
+            )
+            .optional()?)
     }
 
     fn import_vcf(&mut self, book: &str, file: &Path) -> anyhow::Result<usize> {
@@ -531,7 +686,7 @@ impl Store {
         limit: usize,
     ) -> anyhow::Result<Vec<Record>> {
         let mut statement = self.db.prepare(
-            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted
+            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
              FROM records WHERE book_id=?1 AND deleted=0 ORDER BY entity_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![book, limit as i64], row_to_record)?;
@@ -559,7 +714,7 @@ impl Store {
     pub fn get(&self, book: &str, id: &str) -> anyhow::Result<Record> {
         self.db
             .query_row(
-                "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted
+                "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
                  FROM records WHERE book_id=?1 AND entity_id=?2",
                 params![book, id],
                 row_to_record,
@@ -661,52 +816,76 @@ impl Contact {
 }
 
 fn apply_projection(db: &Connection, op: &Op) -> anyhow::Result<()> {
-    match op.kind.as_str() {
-        "contact.put" => {
-            let fields = op.body.clone();
-            let revision = revision(&op.body);
-            db.execute(
-                "INSERT INTO records(book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,0)
-                 ON CONFLICT(book_id,entity_id) DO UPDATE SET
-                   schema_id=excluded.schema_id,
-                   schema_version=excluded.schema_version,
-                   revision=excluded.revision,
-                   fields=excluded.fields,
-                   updated_hlc=excluded.updated_hlc,
-                   deleted=0
-                 WHERE excluded.updated_hlc >= records.updated_hlc",
-                params![
-                    op.book_id,
-                    op.entity_id,
-                    CONTACT_SCHEMA,
-                    CONTACT_VERSION,
-                    revision,
-                    serde_json::to_string(&fields)?,
-                    op.hlc as i64
-                ],
-            )?;
-        }
-        "contact.delete" => {
-            db.execute(
-                "INSERT INTO records(book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted)
-                 VALUES(?1,?2,?3,?4,?5,'{}',?6,1)
-                 ON CONFLICT(book_id,entity_id) DO UPDATE SET
-                   updated_hlc=excluded.updated_hlc,
-                   deleted=1
-                 WHERE excluded.updated_hlc >= records.updated_hlc",
-                params![
-                    op.book_id,
-                    op.entity_id,
-                    CONTACT_SCHEMA,
-                    CONTACT_VERSION,
-                    revision(&op.body),
-                    op.hlc as i64
-                ],
-            )?;
-        }
+    let (schema_id, schema_version, fields, deleted) = match op.kind.as_str() {
+        "contact.put" => (
+            CONTACT_SCHEMA.to_string(),
+            CONTACT_VERSION,
+            op.body.clone(),
+            false,
+        ),
+        "contact.delete" => (
+            CONTACT_SCHEMA.to_string(),
+            CONTACT_VERSION,
+            serde_json::json!({}),
+            true,
+        ),
+        "record.put" => (
+            op.body
+                .get("schema_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown/record")
+                .to_string(),
+            op.body
+                .get("schema_version")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1),
+            op.body
+                .get("fields")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            false,
+        ),
+        "record.delete" => (
+            op.body
+                .get("schema_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown/record")
+                .to_string(),
+            op.body
+                .get("schema_version")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1),
+            serde_json::json!({}),
+            true,
+        ),
         other => bail!("unknown op kind {other}"),
-    }
+    };
+    let revision = revision(&fields);
+    db.execute(
+        "INSERT INTO records(book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(book_id,entity_id) DO UPDATE SET
+           schema_id=excluded.schema_id,
+           schema_version=excluded.schema_version,
+           revision=excluded.revision,
+           fields=excluded.fields,
+           updated_hlc=excluded.updated_hlc,
+           deleted=excluded.deleted,
+           origin=excluded.origin
+         WHERE excluded.updated_hlc > records.updated_hlc
+            OR (excluded.updated_hlc = records.updated_hlc AND excluded.origin >= records.origin)",
+        params![
+            op.book_id,
+            op.entity_id,
+            schema_id,
+            schema_version,
+            revision,
+            serde_json::to_string(&fields)?,
+            op.hlc as i64,
+            deleted as i64,
+            op.device_id,
+        ],
+    )?;
     Ok(())
 }
 
@@ -723,6 +902,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
         })?,
         updated_hlc: row.get::<_, i64>(6)? as u64,
         deleted: row.get::<_, i64>(7)? != 0,
+        origin: row.get(8)?,
     })
 }
 
@@ -743,6 +923,16 @@ fn revision(body: &serde_json::Value) -> String {
         "blake3:{}",
         blake3::hash(serde_json::to_string(body).unwrap_or_default().as_bytes()).to_hex()
     )
+}
+
+fn parse_cursor(cursor: &str) -> anyhow::Result<(u64, String)> {
+    let (hlc, entity) = cursor
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid records cursor"))?;
+    Ok((
+        hlc.parse().context("invalid records cursor hlc")?,
+        entity.into(),
+    ))
 }
 
 fn now_ms() -> u64 {
@@ -1166,6 +1356,114 @@ mod tests {
         let out = dir.path().join("out.vcf");
         assert_eq!(target.export_vcf("test/contacts", &out).unwrap(), 1);
         assert!(fs::read_to_string(out).unwrap().contains("FN:Sync Probe"));
+    }
+
+    #[test]
+    fn remote_entries_merge_by_revision_and_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        let book = "test/records";
+        let fields = serde_json::json!({"value": "first"});
+        assert!(
+            store
+                .apply_entry(
+                    book,
+                    RecordEntry {
+                        entity_id: "one",
+                        schema_id: "test/record",
+                        schema_version: 1,
+                        fields: fields.clone(),
+                        deleted: false,
+                        revision: 100,
+                        origin: "a",
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .apply_entry(
+                    book,
+                    RecordEntry {
+                        entity_id: "one",
+                        schema_id: "test/record",
+                        schema_version: 1,
+                        fields: fields.clone(),
+                        deleted: false,
+                        revision: 100,
+                        origin: "0",
+                    },
+                )
+                .unwrap(),
+            "same revision from a lower origin must not win"
+        );
+        assert!(
+            !store
+                .apply_entry(
+                    book,
+                    RecordEntry {
+                        entity_id: "one",
+                        schema_id: "test/record",
+                        schema_version: 1,
+                        fields: fields.clone(),
+                        deleted: false,
+                        revision: 100,
+                        origin: "a",
+                    },
+                )
+                .unwrap(),
+            "re-delivery must be idempotent"
+        );
+        let record = store.get(book, "one").unwrap();
+        assert_eq!(record.updated_hlc, 100);
+        assert_eq!(record.origin, "a");
+
+        assert!(
+            store
+                .apply_entry(
+                    book,
+                    RecordEntry {
+                        entity_id: "one",
+                        schema_id: "test/record",
+                        schema_version: 1,
+                        fields: serde_json::json!({"value": "second"}),
+                        deleted: false,
+                        revision: 101,
+                        origin: "c",
+                    },
+                )
+                .unwrap()
+        );
+        let changes = store.scan_changes(book, None, 10).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].fields["value"], "second");
+        assert_eq!(changes[0].origin, "c");
+
+        assert!(
+            store
+                .apply_entry(
+                    book,
+                    RecordEntry {
+                        entity_id: "one",
+                        schema_id: "test/record",
+                        schema_version: 1,
+                        fields: serde_json::json!({}),
+                        deleted: true,
+                        revision: 102,
+                        origin: "a",
+                    },
+                )
+                .unwrap()
+        );
+        let changes = store.scan_changes(book, None, 10).unwrap();
+        assert!(changes[0].deleted);
+        let cursor = format!("{}:{}", changes[0].updated_hlc, changes[0].entity_id);
+        assert!(
+            store
+                .scan_changes(book, Some(&cursor), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
