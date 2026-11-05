@@ -22,7 +22,7 @@ use ical_vcard::{Contentline, Parser as VCardParser};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use unibus::client::{Client, ClientConfig};
-use unibus::{Envelope, Message};
+use unibus::{Envelope, Message, PeerSession};
 use uuid::Uuid;
 
 pub const CONTACT_SCHEMA: &str = "fungos.contacts/contact";
@@ -1596,15 +1596,31 @@ fn expand_home_string(value: &str) -> String {
     }
 }
 
+/// Local endpoint identity for one shared `unibus/peer/1` session.
+#[derive(Clone, Debug)]
+pub struct PeerEndpoint {
+    pub installation_id: String,
+    pub producer_id: String,
+}
+
+/// Result of one peer-session records exchange.
+#[derive(Clone, Debug)]
+pub struct PeerSyncOutcome {
+    pub pulled: usize,
+    pub pushed: usize,
+    pub local: Vector,
+    pub remote: Vector,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct PullRequest {
+pub struct PullRequest {
     request_id: String,
     book_id: String,
     vector: Vector,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct OpsResponse {
+pub struct OpsResponse {
     request_id: String,
     book_id: String,
     ops: Vec<Op>,
@@ -1612,21 +1628,21 @@ struct OpsResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PushRequest {
+pub struct PushRequest {
     request_id: String,
     book_id: String,
     ops: Vec<Op>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct AckResponse {
+pub struct AckResponse {
     request_id: String,
     book_id: String,
     applied: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SyncError {
+pub struct SyncError {
     request_id: String,
     book_id: String,
     code: String,
@@ -1801,6 +1817,251 @@ fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyh
         vector_string(&response.vector)
     );
     Ok(())
+}
+
+/// Serve `records.sync.*` frames on one already-authorized shared peer session.
+///
+/// This is transport-neutral: the same function can run over a Unibus TCP hub
+/// adapter, an Iroh `unibus/peer/1` session, or a test session. The session
+/// layer owns identity, grants, expiry, and transport choice.
+pub async fn serve_peer_session(
+    session: &mut dyn PeerSession,
+    store: &mut Store,
+    endpoint: &PeerEndpoint,
+) -> anyhow::Result<()> {
+    loop {
+        let (envelope, payload) = session
+            .receive()
+            .await
+            .map_err(|error| anyhow!("peer receive: {error}"))?;
+        if !payload.is_empty() {
+            continue;
+        }
+        match envelope.message.kind.as_str() {
+            PULL_KIND => {
+                let Ok(request) =
+                    serde_json::from_value::<PullRequest>(envelope.message.body.clone().into())
+                else {
+                    continue;
+                };
+                let response = match store.dump(&request.book_id, Some(&request.vector)) {
+                    Ok(ops) => OpsResponse {
+                        request_id: request.request_id.clone(),
+                        book_id: request.book_id.clone(),
+                        vector: store.vector(&request.book_id)?,
+                        ops,
+                    },
+                    Err(error) => {
+                        reply_peer_error(
+                            session,
+                            endpoint,
+                            &envelope,
+                            &request.request_id,
+                            &request.book_id,
+                            "pull_failed",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                reply_peer(session, endpoint, &envelope, OPS_KIND, &response).await?;
+            }
+            PUSH_KIND => {
+                let Ok(request) =
+                    serde_json::from_value::<PushRequest>(envelope.message.body.clone().into())
+                else {
+                    continue;
+                };
+                let mut applied = 0;
+                let mut failure = None;
+                for op in &request.ops {
+                    match store.apply_op(op) {
+                        Ok(()) => applied += 1,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if let Some(error) = failure {
+                    reply_peer_error(
+                        session,
+                        endpoint,
+                        &envelope,
+                        &request.request_id,
+                        &request.book_id,
+                        "push_failed",
+                        &error.to_string(),
+                    )
+                    .await?;
+                } else {
+                    reply_peer(
+                        session,
+                        endpoint,
+                        &envelope,
+                        ACK_KIND,
+                        &AckResponse {
+                            request_id: request.request_id,
+                            book_id: request.book_id,
+                            applied,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pull then push one book over an already-authorized shared peer session.
+pub async fn sync_peer_session(
+    session: &mut dyn PeerSession,
+    store: &mut Store,
+    book: &str,
+    endpoint: &PeerEndpoint,
+) -> anyhow::Result<PeerSyncOutcome> {
+    let request_id = Uuid::new_v4().to_string();
+    let pull = PullRequest {
+        request_id: request_id.clone(),
+        book_id: book.into(),
+        vector: store.vector(book)?,
+    };
+    send_peer(session, endpoint, PULL_KIND, &pull).await?;
+    let response: OpsResponse = wait_peer(session, OPS_KIND, &request_id).await?;
+    if response.book_id != book {
+        bail!("peer answered for {}", response.book_id);
+    }
+    let mut pulled = 0;
+    for op in &response.ops {
+        store.apply_op(op)?;
+        pulled += 1;
+    }
+    let push_ops = store.dump(book, Some(&response.vector))?;
+    let pushed = push_ops.len();
+    if !push_ops.is_empty() {
+        send_peer(
+            session,
+            endpoint,
+            PUSH_KIND,
+            &PushRequest {
+                request_id: request_id.clone(),
+                book_id: book.into(),
+                ops: push_ops,
+            },
+        )
+        .await?;
+        let ack: AckResponse = wait_peer(session, ACK_KIND, &request_id).await?;
+        if ack.book_id != book {
+            bail!("peer acknowledged {}", ack.book_id);
+        }
+    }
+    Ok(PeerSyncOutcome {
+        pulled,
+        pushed,
+        local: store.vector(book)?,
+        remote: response.vector,
+    })
+}
+
+async fn send_peer<T: Serialize>(
+    session: &mut dyn PeerSession,
+    endpoint: &PeerEndpoint,
+    kind: &str,
+    body: &T,
+) -> anyhow::Result<()> {
+    let envelope = Envelope::new(
+        &endpoint.installation_id,
+        &endpoint.producer_id,
+        Some(session.peer_id()),
+        "",
+        Message::new(kind, serde_json::to_value(body)?),
+    );
+    session
+        .send(&envelope, &[])
+        .await
+        .map_err(|error| anyhow!("peer send: {error}"))
+}
+
+async fn reply_peer<T: Serialize>(
+    session: &mut dyn PeerSession,
+    endpoint: &PeerEndpoint,
+    request: &Envelope,
+    kind: &str,
+    body: &T,
+) -> anyhow::Result<()> {
+    let envelope = Envelope::new(
+        &endpoint.installation_id,
+        &endpoint.producer_id,
+        Some(&request.producer_id),
+        "",
+        Message::new(kind, serde_json::to_value(body)?),
+    );
+    session
+        .send(&envelope, &[])
+        .await
+        .map_err(|error| anyhow!("peer reply: {error}"))
+}
+
+async fn reply_peer_error(
+    session: &mut dyn PeerSession,
+    endpoint: &PeerEndpoint,
+    request: &Envelope,
+    request_id: &str,
+    book_id: &str,
+    code: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    reply_peer(
+        session,
+        endpoint,
+        request,
+        ERROR_KIND,
+        &SyncError {
+            request_id: request_id.into(),
+            book_id: book_id.into(),
+            code: code.into(),
+            detail: detail.into(),
+        },
+    )
+    .await
+}
+
+async fn wait_peer<T: for<'de> Deserialize<'de>>(
+    session: &mut dyn PeerSession,
+    kind: &str,
+    request_id: &str,
+) -> anyhow::Result<T> {
+    loop {
+        let (envelope, payload) = session
+            .receive()
+            .await
+            .map_err(|error| anyhow!("peer receive: {error}"))?;
+        if !payload.is_empty() {
+            continue;
+        }
+        if envelope.message.kind == ERROR_KIND {
+            let error: SyncError =
+                serde_json::from_value(envelope.message.body.into()).context("parse peer error")?;
+            if error.request_id == request_id {
+                bail!("{}: {} ({})", error.code, error.detail, error.book_id);
+            }
+            continue;
+        }
+        if envelope.message.kind != kind {
+            continue;
+        }
+        let body: serde_json::Value = envelope.message.body.into();
+        let response_request = body
+            .get("request_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if response_request != request_id {
+            continue;
+        }
+        return serde_json::from_value(body).context("decode peer response");
+    }
 }
 
 fn send_request<T: Serialize>(
@@ -2146,6 +2407,105 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn shared_peer_session_syncs_records() {
+        use tokio::sync::mpsc;
+        use unibus::PeerFuture;
+
+        struct TestSession {
+            peer: String,
+            outgoing: mpsc::UnboundedSender<(Envelope, Vec<u8>)>,
+            incoming: mpsc::UnboundedReceiver<(Envelope, Vec<u8>)>,
+        }
+
+        impl PeerSession for TestSession {
+            fn peer_id(&self) -> &str {
+                &self.peer
+            }
+
+            fn send<'a>(
+                &'a mut self,
+                envelope: &'a Envelope,
+                payload: &'a [u8],
+            ) -> PeerFuture<'a, ()> {
+                Box::pin(async move {
+                    self.outgoing
+                        .send((envelope.clone(), payload.to_vec()))
+                        .map_err(|error| unibus::PeerError(error.to_string()))
+                })
+            }
+
+            fn receive(&mut self) -> PeerFuture<'_, (Envelope, Vec<u8>)> {
+                Box::pin(async move {
+                    self.incoming
+                        .recv()
+                        .await
+                        .ok_or_else(|| unibus::PeerError("closed".into()))
+                })
+            }
+        }
+
+        fn pair(left: &str, right: &str) -> (TestSession, TestSession) {
+            let (left_tx, left_rx) = mpsc::unbounded_channel();
+            let (right_tx, right_rx) = mpsc::unbounded_channel();
+            (
+                TestSession {
+                    peer: right.into(),
+                    outgoing: right_tx,
+                    incoming: left_rx,
+                },
+                TestSession {
+                    peer: left.into(),
+                    outgoing: left_tx,
+                    incoming: right_rx,
+                },
+            )
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = Store::open(
+            &dir.path().join("studio"),
+            &dir.path().join("studio-device"),
+        )
+        .unwrap();
+        let mut client =
+            Store::open(&dir.path().join("neo"), &dir.path().join("neo-device")).unwrap();
+        server
+            .put_record(
+                "test/contacts",
+                "ada",
+                "fungos.contacts/contact",
+                1,
+                serde_json::json!({"display_name": "Ada Lovelace"}),
+            )
+            .unwrap();
+
+        let (mut client_session, mut server_session) = pair("records.macbook", "records.studio");
+        let server_endpoint = PeerEndpoint {
+            installation_id: "home".into(),
+            producer_id: "records.studio".into(),
+        };
+        let client_endpoint = PeerEndpoint {
+            installation_id: "home".into(),
+            producer_id: "records.macbook".into(),
+        };
+        let server_task = tokio::spawn(async move {
+            let _ = serve_peer_session(&mut server_session, &mut server, &server_endpoint).await;
+        });
+        let outcome = sync_peer_session(
+            &mut client_session,
+            &mut client,
+            "test/contacts",
+            &client_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.pulled, 1);
+        assert_eq!(outcome.pushed, 0);
+        assert_eq!(client.list("test/contacts", None, 10).unwrap().len(), 1);
+        server_task.abort();
     }
 
     #[test]

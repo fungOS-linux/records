@@ -182,6 +182,31 @@ the whole book. `Store::scan_changes(book, cursor, limit)` returns a materialize
 change feed including tombstones. `crates/soil-records-host` in Soil exposes this through
 `soil:records`; `crates/soil-sdk-records` is the guest side.
 
+## Shared peer session
+
+The records sync protocol is transport-neutral. The same `records.sync.*` kinds
+can run over the TCP hub adapter or an already-authorized Unibus peer session:
+
+```rust
+let outcome = records::sync_peer_session(
+    &mut peer_session,
+    &mut store,
+    "personal/avery/contacts",
+    &records::PeerEndpoint {
+        installation_id: "home".into(),
+        producer_id: "records.macbook".into(),
+    },
+).await?;
+```
+
+`serve_peer_session` handles `pull`, `ops`, `push`, `ack`, and typed errors on
+the other side. The session layer owns identity, grants, expiry, encryption, and
+transport choice. This is the same `unibus/peer/1` session other application
+kinds use; records does not define a second Iroh or WiFi transport.
+
+A Spore never imports this API. The Soil/records host owns the session and
+exposes only `soil:records`.
+
 ## Book and schema namespacing
 
 ```text
