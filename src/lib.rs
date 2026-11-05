@@ -526,6 +526,7 @@ impl Store {
         let db = Connection::open(root.join("records.sqlite3"))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS ops(
                op_id TEXT PRIMARY KEY,
