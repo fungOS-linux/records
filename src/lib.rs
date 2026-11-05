@@ -551,6 +551,21 @@ impl Store {
                PRIMARY KEY(book_id, entity_id)
              );
              CREATE INDEX IF NOT EXISTS records_book ON records(book_id);
+             CREATE TABLE IF NOT EXISTS sync_peers(
+               book_id TEXT NOT NULL,
+               peer_id TEXT NOT NULL,
+               PRIMARY KEY(book_id, peer_id)
+             );
+             CREATE TABLE IF NOT EXISTS outbox(
+               book_id TEXT NOT NULL,
+               peer_id TEXT NOT NULL,
+               op_id TEXT NOT NULL,
+               enqueued_hlc INTEGER NOT NULL,
+               attempts INTEGER NOT NULL DEFAULT 0,
+               next_attempt_hlc INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(book_id, peer_id, op_id)
+             );
+             CREATE INDEX IF NOT EXISTS outbox_due ON outbox(book_id, peer_id, next_attempt_hlc);
             ",
         )?;
         let device_id = if device_path.exists() {
@@ -592,6 +607,104 @@ impl Store {
             params![store.device_id],
         )?;
         Ok(store)
+    }
+
+    /// Configure the peers that receive local writes for one book.
+    ///
+    /// This is host policy, not a Spore-visible option. New local ops are
+    /// inserted into a durable per-peer outbox in the same SQLite transaction.
+    pub fn set_sync_peers(&self, book: &str, peers: &[String]) -> anyhow::Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM sync_peers WHERE book_id=?1", params![book])?;
+        for peer in peers {
+            if peer.trim().is_empty() {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO sync_peers(book_id,peer_id) VALUES(?1,?2)",
+                params![book, peer],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn sync_peers(&self, book: &str) -> anyhow::Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT peer_id FROM sync_peers WHERE book_id=?1 ORDER BY peer_id")?;
+        let rows = statement.query_map(params![book], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn pending_outbox(
+        &self,
+        book: &str,
+        peer: &str,
+        now_hlc: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Op>> {
+        let mut statement = self.db.prepare(
+            "SELECT o.op_id,o.book_id,o.device_id,o.seq,o.hlc,o.kind,o.entity_id,o.body
+             FROM outbox x JOIN ops o ON o.op_id=x.op_id
+             WHERE x.book_id=?1 AND x.peer_id=?2 AND x.next_attempt_hlc<=?3
+             ORDER BY o.hlc,o.device_id,o.seq LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                book,
+                peer,
+                now_hlc.min(i64::MAX as u64) as i64,
+                limit as i64
+            ],
+            row_to_op,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn outbox_len(&self, book: &str, peer: &str) -> anyhow::Result<u64> {
+        let count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE book_id=?1 AND peer_id=?2",
+            params![book, peer],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Remove delivered ops. A lost ack is repaired by the next vector exchange;
+    /// applying an op twice is already idempotent.
+    pub fn ack_outbox(&self, book: &str, peer: &str, ops: &[Op]) -> anyhow::Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for op in ops {
+            tx.execute(
+                "DELETE FROM outbox WHERE book_id=?1 AND peer_id=?2 AND op_id=?3",
+                params![book, peer, op.op_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Keep failed ops durable and back them off without blocking the local
+    /// write path or the rest of the outbox.
+    pub fn defer_outbox(
+        &self,
+        book: &str,
+        peer: &str,
+        ops: &[Op],
+        next_attempt_hlc: u64,
+    ) -> anyhow::Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for op in ops {
+            tx.execute(
+                "UPDATE outbox
+                 SET attempts=attempts+1, next_attempt_hlc=?4
+                 WHERE book_id=?1 AND peer_id=?2 AND op_id=?3",
+                params![book, peer, op.op_id, next_attempt_hlc as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn next_seq(&self, book: &str) -> anyhow::Result<u64> {
@@ -682,9 +795,10 @@ impl Store {
             body,
         };
         op.op_id = op_id(&op)?;
-        apply_projection(&self.db, &op)?;
+        let tx = self.db.unchecked_transaction()?;
+        apply_projection(&tx, &op)?;
         let body = serde_json::to_string(&op.body)?;
-        self.db.execute(
+        tx.execute(
             "INSERT INTO ops(op_id,book_id,device_id,seq,hlc,kind,entity_id,body)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
@@ -698,6 +812,16 @@ impl Store {
                 body
             ],
         )?;
+        // Only local device writes enter the outbox. Remote apply never echoes
+        // an op back to the peer it came from.
+        if op.device_id == self.device_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO outbox(book_id,peer_id,op_id,enqueued_hlc)
+                 SELECT ?1, peer_id, ?2, ?3 FROM sync_peers WHERE book_id=?1",
+                params![op.book_id, op.op_id, op.hlc as i64],
+            )?;
+        }
+        tx.commit()?;
         Ok(op)
     }
 
@@ -1086,20 +1210,7 @@ impl Store {
             "SELECT op_id,book_id,device_id,seq,hlc,kind,entity_id,body
              FROM ops WHERE book_id=?1 ORDER BY hlc, device_id, seq",
         )?;
-        let rows = statement.query_map(params![book], |row| {
-            let body: String = row.get(7)?;
-            Ok(Op {
-                op_id: row.get(0)?,
-                book_id: row.get(1)?,
-                device_id: row.get(2)?,
-                seq: row.get::<_, i64>(3)? as u64,
-                hlc: row.get::<_, i64>(4)? as u64,
-                kind: row.get(5)?,
-                entity_id: row.get(6)?,
-                body: serde_json::from_str(&body)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-            })
-        })?;
+        let rows = statement.query_map(params![book], row_to_op)?;
         let mut ops = rows.collect::<Result<Vec<_>, _>>()?;
         if let Some(vector) = since {
             ops.retain(|op| vector.devices.get(&op.device_id).copied().unwrap_or(0) < op.seq);
@@ -1231,6 +1342,21 @@ fn apply_projection(db: &Connection, op: &Op) -> anyhow::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn row_to_op(row: &rusqlite::Row<'_>) -> rusqlite::Result<Op> {
+    let body: String = row.get(7)?;
+    Ok(Op {
+        op_id: row.get(0)?,
+        book_id: row.get(1)?,
+        device_id: row.get(2)?,
+        seq: row.get::<_, i64>(3)? as u64,
+        hlc: row.get::<_, i64>(4)? as u64,
+        kind: row.get(5)?,
+        entity_id: row.get(6)?,
+        body: serde_json::from_str(&body)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+    })
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
@@ -2529,6 +2655,86 @@ mod tests {
         assert_eq!(outcome.pushed, 0);
         assert_eq!(client.list("test/contacts", None, 10).unwrap().len(), 1);
         server_task.abort();
+    }
+
+    #[test]
+    fn outbox_is_durable_per_peer_and_does_not_echo_remote_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        store
+            .set_sync_peers("test/contacts", &["peer-a".into(), "peer-b".into()])
+            .unwrap();
+        let local = store
+            .put_record(
+                "test/contacts",
+                "ada",
+                "fungos.contacts/contact",
+                1,
+                serde_json::json!({"display_name": "Ada Lovelace"}),
+            )
+            .unwrap();
+        for peer in ["peer-a", "peer-b"] {
+            let pending = store
+                .pending_outbox("test/contacts", peer, u64::MAX, 10)
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].op_id, local.op_id);
+        }
+
+        let mut remote = Op {
+            op_id: String::new(),
+            book_id: "test/contacts".into(),
+            device_id: "remote-device".into(),
+            seq: 1,
+            hlc: local.hlc + 1,
+            kind: "record.put".into(),
+            entity_id: "grace".into(),
+            body: serde_json::json!({
+                "schema_id": "fungos.contacts/contact",
+                "schema_version": 1,
+                "fields": {"display_name": "Grace Hopper"}
+            }),
+        };
+        remote.op_id = op_id(&remote).unwrap();
+        store.apply_op(&remote).unwrap();
+        assert_eq!(
+            store
+                .pending_outbox("test/contacts", "peer-a", u64::MAX, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store
+            .defer_outbox("test/contacts", "peer-a", &[local.clone()], 100)
+            .unwrap();
+        assert!(
+            store
+                .pending_outbox("test/contacts", "peer-a", 99, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .pending_outbox("test/contacts", "peer-a", 100, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .ack_outbox("test/contacts", "peer-a", &[local])
+            .unwrap();
+        assert_eq!(store.outbox_len("test/contacts", "peer-a").unwrap(), 0);
+        assert_eq!(store.outbox_len("test/contacts", "peer-b").unwrap(), 1);
+        store
+            .ack_outbox(
+                "test/contacts",
+                "peer-b",
+                &store
+                    .pending_outbox("test/contacts", "peer-b", u64::MAX, 10)
+                    .unwrap(),
+            )
+            .unwrap();
     }
 
     #[test]
