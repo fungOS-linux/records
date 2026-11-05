@@ -1135,7 +1135,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "unibus"
 version = "0.1.0"
-source = "git+https://github.com/fungOS-linux/unibus.git?rev=89f7e5eda8426c13d6e7d71a433b0d82d2c37392#89f7e5eda8426c13d6e7d71a433b0d82d2c37392"
+source = "git+https://github.com/fungOS-linux/unibus.git?rev=8bf8f79#8bf8f79e48252feacd4ba84a04a5c8d3c0a91a9a"
 dependencies = [
  "anyhow",
  "serde",
