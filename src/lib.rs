@@ -1834,15 +1834,37 @@ pub async fn serve_peer_session(
             .receive()
             .await
             .map_err(|error| anyhow!("peer receive: {error}"))?;
-        if !payload.is_empty() {
-            continue;
-        }
+        handle_peer_frame(session, store, endpoint, &envelope, &payload).await?;
+    }
+}
+
+/// Handle one frame on a shared peer session. Returns whether the kind belongs
+/// to the records sync protocol. A shared host router can call this alongside
+/// Geode and other application handlers.
+pub fn is_sync_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        PULL_KIND | OPS_KIND | PUSH_KIND | ACK_KIND | ERROR_KIND
+    )
+}
+
+pub async fn handle_peer_frame(
+    session: &mut dyn PeerSession,
+    store: &mut Store,
+    endpoint: &PeerEndpoint,
+    envelope: &Envelope,
+    payload: &[u8],
+) -> anyhow::Result<bool> {
+    if !payload.is_empty() || !is_sync_kind(&envelope.message.kind) {
+        return Ok(false);
+    }
+    {
         match envelope.message.kind.as_str() {
             PULL_KIND => {
                 let Ok(request) =
                     serde_json::from_value::<PullRequest>(envelope.message.body.clone().into())
                 else {
-                    continue;
+                    return Ok(true);
                 };
                 let response = match store.dump(&request.book_id, Some(&request.vector)) {
                     Ok(ops) => OpsResponse {
@@ -1862,7 +1884,7 @@ pub async fn serve_peer_session(
                             &error.to_string(),
                         )
                         .await?;
-                        continue;
+                        return Ok(true);
                     }
                 };
                 reply_peer(session, endpoint, &envelope, OPS_KIND, &response).await?;
@@ -1871,7 +1893,7 @@ pub async fn serve_peer_session(
                 let Ok(request) =
                     serde_json::from_value::<PushRequest>(envelope.message.body.clone().into())
                 else {
-                    continue;
+                    return Ok(true);
                 };
                 let mut applied = 0;
                 let mut failure = None;
@@ -1913,6 +1935,7 @@ pub async fn serve_peer_session(
             _ => {}
         }
     }
+    Ok(true)
 }
 
 /// Pull then push one book over an already-authorized shared peer session.
