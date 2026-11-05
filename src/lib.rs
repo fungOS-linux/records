@@ -732,6 +732,49 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Substring search over the projected record bodies in one book.
+    /// Results are newest-first. This is a local discovery index, not the
+    /// authority for a field-level query language.
+    pub fn search_book(
+        &self,
+        book: &str,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Record>> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.db.prepare(
+            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
+             FROM records
+             WHERE book_id=?1 AND deleted=0 AND fields LIKE ?2 ESCAPE '\\'
+             ORDER BY updated_hlc DESC, entity_id LIMIT ?3",
+        )?;
+        let pattern = format!("%{}%", escape_like(query));
+        let rows = statement.query_map(params![book, pattern, limit as i64], row_to_record)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Search a host-approved set of books and merge by recency.
+    pub fn search_books(
+        &self,
+        books: &[&str],
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Record>> {
+        let mut records = Vec::new();
+        for book in books {
+            records.extend(self.search_book(book, query, limit)?);
+        }
+        records.sort_by(|a, b| {
+            b.updated_hlc
+                .cmp(&a.updated_hlc)
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
     pub fn get(&self, book: &str, id: &str) -> anyhow::Result<Record> {
         self.db
             .query_row(
@@ -944,6 +987,13 @@ fn revision(body: &serde_json::Value) -> String {
         "blake3:{}",
         blake3::hash(serde_json::to_string(body).unwrap_or_default().as_bytes()).to_hex()
     )
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn parse_cursor(cursor: &str) -> anyhow::Result<(u64, String)> {
@@ -1484,6 +1534,46 @@ mod tests {
                 .scan_changes(book, Some(&cursor), 10)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn searches_books_by_body_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        store
+            .put_record(
+                "test/contacts",
+                "ada",
+                "fungos.contacts/contact",
+                1,
+                serde_json::json!({"display_name": "Ada Lovelace", "emails": [{"value": "ada@example.invalid"}]}),
+            )
+            .unwrap();
+        store
+            .put_record(
+                "test/contacts",
+                "grace",
+                "fungos.contacts/contact",
+                1,
+                serde_json::json!({"display_name": "Grace Hopper", "emails": [{"value": "grace@example.invalid"}]}),
+            )
+            .unwrap();
+        let hits = store.search_book("test/contacts", "lovelace", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "ada");
+        assert!(
+            store
+                .search_book("test/contacts", "100%", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_books(&["test/contacts"], "example.invalid", 10)
+                .unwrap()
+                .len(),
+            2
         );
     }
 
