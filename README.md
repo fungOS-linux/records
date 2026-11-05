@@ -14,6 +14,7 @@ encryption model.
 - built-in schema `fungos.contacts/contact@1`
 - macOS Contacts vCard import
 - vCard export
+- iCalendar import/export for events, with raw VEVENT/VTIMEZONE preservation
 - list/search/stat/vector/dump/apply
 - generic schema-tagged entries plus the built-in contacts schema
 - materialized changes and revision/origin merge
@@ -29,6 +30,28 @@ records --root ~/.local/share/fungos/records init
 records --root ~/.local/share/fungos/records import-vcf \
   --book personal/avery/contacts \
   /tmp/contacts.vcf
+```
+
+## Import a calendar
+
+```sh
+records --root ~/.local/share/fungos/records import-ics \
+  --book personal/avery/calendar \
+  /tmp/calendar.ics
+
+records --root ~/.local/share/fungos/records list \
+  --book personal/avery/calendar
+```
+
+`import-ics` stores events under `fungos.calendar/event@1`. The first slice
+keeps the raw VEVENT, referenced VTIMEZONE blocks, timezone id, all-day flag,
+organizer, attendees, categories, recurrence rule, and basic timestamps. It
+does not yet expand recurrence or resolve timezone transitions for display.
+Export round-trips the stored raw event components:
+
+```sh
+records --root ~/.local/share/fungos/records export-ics \
+  --book personal/avery/calendar --output /tmp/calendar-out.ics
 ```
 
 ## Inspect

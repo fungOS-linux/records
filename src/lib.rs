@@ -25,8 +25,10 @@ use unibus::client::{Client, ClientConfig};
 use unibus::{Envelope, Message};
 use uuid::Uuid;
 
-const CONTACT_SCHEMA: &str = "fungos.contacts/contact";
+pub const CONTACT_SCHEMA: &str = "fungos.contacts/contact";
+pub const CALENDAR_SCHEMA: &str = "fungos.calendar/event";
 const CONTACT_VERSION: i64 = 1;
+const CALENDAR_VERSION: i64 = 1;
 const PULL_KIND: &str = "records.sync.pull.v1";
 const OPS_KIND: &str = "records.sync.ops.v1";
 const PUSH_KIND: &str = "records.sync.push.v1";
@@ -52,6 +54,17 @@ enum Cmd {
         file: PathBuf,
     },
     ExportVcf {
+        #[arg(long)]
+        book: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    ImportIcs {
+        #[arg(long)]
+        book: String,
+        file: PathBuf,
+    },
+    ExportIcs {
         #[arg(long)]
         book: String,
         #[arg(long)]
@@ -127,6 +140,14 @@ pub fn run_cli() -> anyhow::Result<()> {
             let count = store.export_vcf(&book, &output)?;
             println!("exported {count} contacts to {}", output.display());
         }
+        Cmd::ImportIcs { book, file } => {
+            let count = store.import_ics(&book, &file)?;
+            println!("imported {count} events into {book}");
+        }
+        Cmd::ExportIcs { book, output } => {
+            let count = store.export_ics(&book, &output)?;
+            println!("exported {count} events to {}", output.display());
+        }
         Cmd::List {
             book,
             search,
@@ -138,17 +159,34 @@ pub fn run_cli() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&records)?);
             } else {
                 for record in records {
-                    let contact: Contact = serde_json::from_value(record.fields)?;
-                    println!(
-                        "{}\t{}\t{}",
-                        record.entity_id,
-                        contact.display_name,
-                        contact
-                            .emails
-                            .first()
-                            .map(|e| e.value.as_str())
-                            .unwrap_or("")
-                    );
+                    match record.schema_id.as_str() {
+                        CONTACT_SCHEMA => {
+                            let contact: Contact = serde_json::from_value(record.fields)?;
+                            println!(
+                                "{}\t{}\t{}",
+                                record.entity_id,
+                                contact.display_name,
+                                contact
+                                    .emails
+                                    .first()
+                                    .map(|e| e.value.as_str())
+                                    .unwrap_or("")
+                            );
+                        }
+                        CALENDAR_SCHEMA => {
+                            let event: CalendarEvent = serde_json::from_value(record.fields)?;
+                            println!(
+                                "{}\t{}\t{}\t{}",
+                                record.entity_id, event.start, event.end, event.summary
+                            );
+                        }
+                        _ => println!(
+                            "{}\t{}\t{}",
+                            record.entity_id,
+                            record.schema_id,
+                            serde_json::to_string(&record.fields)?
+                        ),
+                    }
                 }
             }
         }
@@ -376,6 +414,36 @@ pub struct Contact {
 pub struct LabeledValue {
     label: String,
     value: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    pub summary: String,
+    pub description: String,
+    pub location: String,
+    pub status: String,
+    pub uid: String,
+    pub start: String,
+    pub end: String,
+    pub duration: String,
+    pub all_day: bool,
+    pub timezone: String,
+    pub rrule: String,
+    pub categories: Vec<String>,
+    pub organizer: CalendarAttendee,
+    pub attendees: Vec<CalendarAttendee>,
+    pub url: String,
+    pub created: String,
+    pub last_modified: String,
+    pub sequence: String,
+    pub raw_ics: String,
+    pub raw_timezones: Vec<String>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct CalendarAttendee {
+    pub name: String,
+    pub value: String,
 }
 
 /// One materialized entry accepted from a peer.
@@ -666,7 +734,7 @@ impl Store {
     }
 
     fn export_vcf(&self, book: &str, output: &Path) -> anyhow::Result<usize> {
-        let records = self.list(book, None, usize::MAX)?;
+        let records = self.list_schema(book, CONTACT_SCHEMA, usize::MAX)?;
         let mut out = String::new();
         for record in &records {
             let contact: Contact = serde_json::from_value(record.fields.clone())?;
@@ -677,6 +745,68 @@ impl Store {
         }
         fs::write(output, out)?;
         Ok(records.len())
+    }
+
+    fn import_ics(&mut self, book: &str, file: &Path) -> anyhow::Result<usize> {
+        let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+        let events = parse_ics(&text)?;
+        let mut count = 0;
+        for (entity_id, event) in events {
+            let body = serde_json::to_value(&event)?;
+            self.put_record(book, &entity_id, CALENDAR_SCHEMA, CALENDAR_VERSION, body)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn export_ics(&self, book: &str, output: &Path) -> anyhow::Result<usize> {
+        let records = self.list_schema(book, CALENDAR_SCHEMA, usize::MAX)?;
+        let mut events = Vec::new();
+        let mut timezones = Vec::new();
+        for record in &records {
+            let event: CalendarEvent = serde_json::from_value(record.fields.clone())?;
+            for timezone in &event.raw_timezones {
+                if !timezones.contains(timezone) {
+                    timezones.push(timezone.clone());
+                }
+            }
+            events.push(event);
+        }
+        let mut out = String::from(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fungOS//records//EN\r\nCALSCALE:GREGORIAN\r\n",
+        );
+        for timezone in timezones {
+            out.push_str(&timezone);
+            if !out.ends_with('\n') {
+                out.push_str("\r\n");
+            }
+        }
+        for event in &events {
+            out.push_str(&event.raw_ics);
+            if !out.ends_with('\n') {
+                out.push_str("\r\n");
+            }
+        }
+        out.push_str("END:VCALENDAR\r\n");
+        fs::write(output, out)?;
+        Ok(events.len())
+    }
+
+    /// Page live records carrying one schema id.
+    pub fn list_schema(
+        &self,
+        book: &str,
+        schema_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Record>> {
+        let mut statement = self.db.prepare(
+            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
+             FROM records
+             WHERE book_id=?1 AND schema_id=?2 AND deleted=0
+             ORDER BY entity_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![book, schema_id, limit as i64], row_to_record)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn list(
@@ -693,19 +823,36 @@ impl Store {
         let mut records = rows.collect::<Result<Vec<_>, _>>()?;
         if let Some(search) = search {
             let search = search.to_lowercase();
-            records.retain(|record| {
-                let contact: Contact = serde_json::from_value(record.fields.clone())
-                    .unwrap_or_else(|_| Contact::empty());
-                contact.display_name.to_lowercase().contains(&search)
-                    || contact.organization.to_lowercase().contains(&search)
-                    || contact
-                        .emails
-                        .iter()
-                        .any(|e| e.value.to_lowercase().contains(&search))
-                    || contact
-                        .phones
-                        .iter()
-                        .any(|p| p.value.to_lowercase().contains(&search))
+            records.retain(|record| match record.schema_id.as_str() {
+                CONTACT_SCHEMA => {
+                    let contact: Contact = serde_json::from_value(record.fields.clone())
+                        .unwrap_or_else(|_| Contact::empty());
+                    contact.display_name.to_lowercase().contains(&search)
+                        || contact.organization.to_lowercase().contains(&search)
+                        || contact
+                            .emails
+                            .iter()
+                            .any(|e| e.value.to_lowercase().contains(&search))
+                        || contact
+                            .phones
+                            .iter()
+                            .any(|p| p.value.to_lowercase().contains(&search))
+                }
+                CALENDAR_SCHEMA => {
+                    let event: CalendarEvent =
+                        serde_json::from_value(record.fields.clone()).unwrap_or_default();
+                    event.summary.to_lowercase().contains(&search)
+                        || event.description.to_lowercase().contains(&search)
+                        || event.location.to_lowercase().contains(&search)
+                        || event
+                            .attendees
+                            .iter()
+                            .any(|a| a.value.to_lowercase().contains(&search))
+                }
+                _ => serde_json::to_string(&record.fields)
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&search),
             });
         }
         Ok(records)
@@ -1043,6 +1190,154 @@ fn parse_vcards(text: &str) -> anyhow::Result<Vec<(String, Contact)>> {
         out.push((uid, contact));
     }
     Ok(out)
+}
+
+fn parse_ics(text: &str) -> anyhow::Result<Vec<(String, CalendarEvent)>> {
+    let lines = VCardParser::new(text.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse iCalendar")?;
+    let mut timezones = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if is_begin(&lines[index], "VTIMEZONE") {
+            let (block, next) = collect_component(&lines, index);
+            timezones.push(raw_block(&block));
+            index = next;
+        } else {
+            index += 1;
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if is_begin(&lines[index], "VEVENT") {
+            let (block, next) = collect_component(&lines, index);
+            let mut event = event_from_lines(&block)?;
+            event.raw_timezones = timezones.clone();
+            let entity_id = if event.uid.trim().is_empty() {
+                format!("event-{}", blake3::hash(event.raw_ics.as_bytes()).to_hex())
+            } else {
+                event.uid.trim().to_string()
+            };
+            events.push((entity_id, event));
+            index = next;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(events)
+}
+
+fn is_begin(line: &Contentline, component: &str) -> bool {
+    line.name().eq_ignore_ascii_case("BEGIN") && line.value().eq_ignore_ascii_case(component)
+}
+
+fn collect_component(lines: &[Contentline], start: usize) -> (Vec<Contentline>, usize) {
+    let mut depth = 0usize;
+    for index in start..lines.len() {
+        let name = lines[index].name();
+        if name.eq_ignore_ascii_case("BEGIN") {
+            depth += 1;
+        } else if name.eq_ignore_ascii_case("END") {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return (lines[start..=index].to_vec(), index + 1);
+            }
+        }
+    }
+    (lines[start..].to_vec(), lines.len())
+}
+
+fn raw_block(lines: &[Contentline]) -> String {
+    let mut raw = String::new();
+    for line in lines {
+        raw.push_str(&line.to_string());
+        raw.push_str("\r\n");
+    }
+    raw
+}
+
+fn event_from_lines(lines: &[Contentline]) -> anyhow::Result<CalendarEvent> {
+    let mut event = CalendarEvent {
+        raw_ics: raw_block(lines),
+        ..CalendarEvent::default()
+    };
+    let mut depth = 0usize;
+    for line in lines {
+        let name = line.name().to_ascii_uppercase();
+        if name == "BEGIN" {
+            depth += 1;
+            continue;
+        }
+        if name == "END" {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth != 1 {
+            continue;
+        }
+        match name.as_str() {
+            "SUMMARY" => event.summary = unescape(line.value()),
+            "DESCRIPTION" => event.description = unescape(line.value()),
+            "LOCATION" => event.location = unescape(line.value()),
+            "STATUS" => event.status = unescape(line.value()),
+            "UID" => event.uid = unescape(line.value()),
+            "DTSTART" => {
+                event.start = unescape(line.value());
+                event.all_day = is_date_value(line);
+                event.timezone = param(line, "TZID").unwrap_or_default();
+            }
+            "DTEND" => event.end = unescape(line.value()),
+            "DURATION" => event.duration = unescape(line.value()),
+            "RRULE" => event.rrule = unescape(line.value()),
+            "URL" => event.url = unescape(line.value()),
+            "CREATED" => event.created = unescape(line.value()),
+            "LAST-MODIFIED" => event.last_modified = unescape(line.value()),
+            "SEQUENCE" => event.sequence = unescape(line.value()),
+            "CATEGORIES" => {
+                event.categories = line
+                    .value()
+                    .split(',')
+                    .map(unescape)
+                    .filter(|value| !value.is_empty())
+                    .collect();
+            }
+            "ORGANIZER" => event.organizer = attendee_from_line(line),
+            "ATTENDEE" => event.attendees.push(attendee_from_line(line)),
+            _ => {}
+        }
+    }
+    Ok(event)
+}
+
+fn param(line: &Contentline, name: &str) -> Option<String> {
+    line.params()
+        .iter()
+        .filter(|param| param.name().eq_ignore_ascii_case(name))
+        .flat_map(|param| param.values().iter())
+        .map(|value| unescape(value.as_str()))
+        .next()
+}
+
+fn is_date_value(line: &Contentline) -> bool {
+    if param(line, "VALUE").is_some_and(|value| value.eq_ignore_ascii_case("DATE")) {
+        return true;
+    }
+    let value = line.value();
+    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn attendee_from_line(line: &Contentline) -> CalendarAttendee {
+    let name = param(line, "CN").unwrap_or_default();
+    let mut value = unescape(line.value());
+    if value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+    {
+        value = value.get(7..).unwrap_or_default().to_string();
+    }
+    CalendarAttendee { name, value }
 }
 
 fn contact_from_lines(lines: &[Contentline]) -> anyhow::Result<Contact> {
@@ -1427,6 +1722,81 @@ mod tests {
         let out = dir.path().join("out.vcf");
         assert_eq!(target.export_vcf("test/contacts", &out).unwrap(), 1);
         assert!(fs::read_to_string(out).unwrap().contains("FN:Sync Probe"));
+    }
+
+    #[test]
+    fn imports_and_exports_ical_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let ics = dir.path().join("calendar.ics");
+        fs::write(
+            &ics,
+            "BEGIN:VCALENDAR\r\n\
+             VERSION:2.0\r\n\
+             PRODID:-//Probe//EN\r\n\
+             BEGIN:VTIMEZONE\r\n\
+             TZID:America/Los_Angeles\r\n\
+             BEGIN:STANDARD\r\n\
+             DTSTART:19701101T020000\r\n\
+             TZOFFSETFROM:-0700\r\n\
+             TZOFFSETTO:-0800\r\n\
+             END:STANDARD\r\n\
+             END:VTIMEZONE\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:event-1\r\n\
+             SUMMARY:Design review\r\n\
+             DESCRIPTION:Line one\\nLine two\r\n\
+             LOCATION:Studio\r\n\
+             DTSTART;TZID=America/Los_Angeles:20261105T100000\r\n\
+             DTEND;TZID=America/Los_Angeles:20261105T110000\r\n\
+             ORGANIZER;CN=Avery:mailto:avery@example.invalid\r\n\
+             ATTENDEE;CN=Ada:mailto:ada@example.invalid\r\n\
+             RRULE:FREQ=WEEKLY;COUNT=3\r\n\
+             CATEGORIES:Work,Design\r\n\
+             BEGIN:VALARM\r\n\
+             ACTION:DISPLAY\r\n\
+             TRIGGER:-PT15M\r\n\
+             DESCRIPTION:Reminder\r\n\
+             END:VALARM\r\n\
+             END:VEVENT\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:event-2\r\n\
+             SUMMARY:Holiday\r\n\
+             DTSTART;VALUE=DATE:20261225\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(&dir.path().join("store"), &dir.path().join("device")).unwrap();
+        assert_eq!(store.import_ics("test/calendar", &ics).unwrap(), 2);
+        let records = store
+            .list_schema("test/calendar", CALENDAR_SCHEMA, 10)
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        let first: CalendarEvent = serde_json::from_value(records[0].fields.clone()).unwrap();
+        assert_eq!(first.summary, "Design review");
+        assert_eq!(first.location, "Studio");
+        assert_eq!(first.start, "20261105T100000");
+        assert_eq!(first.timezone, "America/Los_Angeles");
+        assert_eq!(first.organizer.value, "avery@example.invalid");
+        assert_eq!(first.attendees[0].name, "Ada");
+        assert_eq!(first.rrule, "FREQ=WEEKLY;COUNT=3");
+        assert_eq!(first.categories, ["Work", "Design"]);
+        assert!(first.raw_ics.contains("BEGIN:VALARM"));
+        assert_eq!(first.raw_timezones.len(), 1);
+        assert!(first.description.contains("Line one\nLine two"));
+
+        let second: CalendarEvent = serde_json::from_value(records[1].fields.clone()).unwrap();
+        assert!(second.all_day);
+        assert_eq!(second.start, "20261225");
+
+        let out = dir.path().join("out.ics");
+        assert_eq!(store.export_ics("test/calendar", &out).unwrap(), 2);
+        let exported = fs::read_to_string(out).unwrap();
+        assert!(exported.starts_with("BEGIN:VCALENDAR"));
+        assert!(exported.contains("BEGIN:VTIMEZONE"));
+        assert!(exported.contains("SUMMARY:Design review"));
+        assert!(exported.contains("SUMMARY:Holiday"));
     }
 
     #[test]
