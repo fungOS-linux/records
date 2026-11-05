@@ -441,6 +441,8 @@ pub struct Contact {
     pub note: String,
     pub birthday: String,
     pub uid: String,
+    pub created: String,
+    pub last_modified: String,
     pub raw_vcard: String,
 }
 
@@ -1266,6 +1268,8 @@ impl Contact {
             note: String::new(),
             birthday: String::new(),
             uid: String::new(),
+            created: String::new(),
+            last_modified: String::new(),
             raw_vcard: String::new(),
         }
     }
@@ -1618,6 +1622,8 @@ fn contact_from_lines(lines: &[Contentline]) -> anyhow::Result<Contact> {
             "UID" => contact.uid = unescape(line.value()),
             "NOTE" => contact.note = unescape(line.value()),
             "BDAY" => contact.birthday = unescape(line.value()),
+            "CREATED" => contact.created = unescape(line.value()),
+            "LAST-MODIFIED" | "REV" => contact.last_modified = unescape(line.value()),
             "EMAIL" => contact.emails.push(labeled(line)),
             "TEL" => contact.phones.push(labeled(line)),
             "ADR" => contact.addresses.push(labeled(line)),
@@ -2273,7 +2279,7 @@ fn wait_for<T: for<'de> Deserialize<'de>>(
 mod tests {
     use super::*;
 
-    const CARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:test-1\r\nFN:Sync Probe\r\nN:Probe;Sync;;;\r\nEMAIL;TYPE=WORK:sync-probe@example.invalid\r\nEND:VCARD\r\n";
+    const CARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:test-1\r\nFN:Sync Probe\r\nN:Probe;Sync;;;\r\nEMAIL;TYPE=WORK:sync-probe@example.invalid\r\nCREATED:20260102T030405Z\r\nREV:20260203T040506Z\r\nEND:VCARD\r\n";
 
     #[test]
     fn imports_exports_and_round_trips_ops() {
@@ -2287,6 +2293,8 @@ mod tests {
         let contact: Contact = serde_json::from_value(records[0].fields.clone()).unwrap();
         assert_eq!(contact.display_name, "Sync Probe");
         assert_eq!(contact.emails[0].value, "sync-probe@example.invalid");
+        assert_eq!(contact.created, "20260102T030405Z");
+        assert_eq!(contact.last_modified, "20260203T040506Z");
 
         let ops = source.dump("test/contacts", None).unwrap();
         assert_eq!(ops.len(), 1);
