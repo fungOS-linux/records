@@ -116,8 +116,9 @@ store.apply_entry(book, RecordEntry {
 })?;
 ```
 
-`Store::scan_changes(book, cursor, limit)` returns a materialized change feed
-including tombstones. `crates/soil-records-host` in Soil exposes this through
+`Store::scan_records(book, cursor, limit)` pages live records without loading
+the whole book. `Store::scan_changes(book, cursor, limit)` returns a materialized
+change feed including tombstones. `crates/soil-records-host` in Soil exposes this through
 `soil:records`; `crates/soil-sdk-records` is the guest side.
 
 ## Book and schema namespacing

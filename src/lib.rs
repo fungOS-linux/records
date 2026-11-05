@@ -711,6 +711,27 @@ impl Store {
         Ok(records)
     }
 
+    /// Page live records by entity id. This is the SQL-backed `scan` path;
+    /// callers do not load the whole book.
+    pub fn scan_records(
+        &self,
+        book: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Record>> {
+        let mut statement = self.db.prepare(
+            "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
+             FROM records
+             WHERE book_id=?1 AND deleted=0 AND entity_id > ?2
+             ORDER BY entity_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![book, cursor.unwrap_or_default(), limit as i64],
+            row_to_record,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn get(&self, book: &str, id: &str) -> anyhow::Result<Record> {
         self.db
             .query_row(
