@@ -1,0 +1,16 @@
+# Host-side feed list for `records sync-feeds`.
+#
+# Keep this in your dotfiles repo, then point the command at it:
+#   records sync-feeds --config ~/.config/fungos/feeds.toml
+
+default_book = "personal/avery/feeds"
+
+[[feeds]]
+url = "https://blog.rust-lang.org/feed.xml"
+title = "Rust Blog"
+limit = 100
+
+[[feeds]]
+url = "https://example.com/atom.xml"
+book = "personal/avery/reading"
+title = "Example Atom"

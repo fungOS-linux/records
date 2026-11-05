@@ -8,7 +8,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -27,8 +27,13 @@ use uuid::Uuid;
 
 pub const CONTACT_SCHEMA: &str = "fungos.contacts/contact";
 pub const CALENDAR_SCHEMA: &str = "fungos.calendar/event";
+pub const FEED_ITEM_SCHEMA: &str = "fungos.feeds/item";
 const CONTACT_VERSION: i64 = 1;
 const CALENDAR_VERSION: i64 = 1;
+const FEED_ITEM_VERSION: i64 = 1;
+const MAX_FEED_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_FEED_LIMIT: usize = 250;
+const FEED_TIMEOUT: Duration = Duration::from_secs(20);
 const PULL_KIND: &str = "records.sync.pull.v1";
 const OPS_KIND: &str = "records.sync.ops.v1";
 const PUSH_KIND: &str = "records.sync.push.v1";
@@ -69,6 +74,19 @@ enum Cmd {
         book: String,
         #[arg(long)]
         output: PathBuf,
+    },
+    ImportRss {
+        #[arg(long)]
+        book: String,
+        /// HTTP(S) URL or a local file path.
+        #[arg(long)]
+        feed: String,
+        #[arg(long, default_value_t = DEFAULT_FEED_LIMIT)]
+        limit: usize,
+    },
+    SyncFeeds {
+        #[arg(long, default_value = "~/.config/fungos/feeds.toml")]
+        config: PathBuf,
     },
     List {
         #[arg(long)]
@@ -148,6 +166,15 @@ pub fn run_cli() -> anyhow::Result<()> {
             let count = store.export_ics(&book, &output)?;
             println!("exported {count} events to {}", output.display());
         }
+        Cmd::ImportRss { book, feed, limit } => {
+            let count = store.import_rss(&book, &feed, limit)?;
+            println!("imported {count} feed items into {book}");
+        }
+        Cmd::SyncFeeds { config } => {
+            let config = expand_home_path(&config);
+            let count = store.sync_feeds(&config)?;
+            println!("imported {count} feed items from {}", config.display());
+        }
         Cmd::List {
             book,
             search,
@@ -180,6 +207,13 @@ pub fn run_cli() -> anyhow::Result<()> {
                                 record.entity_id, event.start, event.end, event.summary
                             );
                         }
+                        FEED_ITEM_SCHEMA => println!(
+                            "{}\t{}\t{}\t{}",
+                            record.entity_id,
+                            record.fields["published"].as_str().unwrap_or(""),
+                            record.fields["title"].as_str().unwrap_or(""),
+                            record.fields["link"].as_str().unwrap_or("")
+                        ),
                         _ => println!(
                             "{}\t{}\t{}",
                             record.entity_id,
@@ -444,6 +478,28 @@ pub struct CalendarEvent {
 pub struct CalendarAttendee {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedsConfig {
+    #[serde(default)]
+    default_book: Option<String>,
+    feeds: Vec<FeedConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedConfig {
+    url: String,
+    #[serde(default)]
+    book: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default = "default_feed_limit")]
+    limit: usize,
+}
+
+fn default_feed_limit() -> usize {
+    DEFAULT_FEED_LIMIT
 }
 
 /// One materialized entry accepted from a peer.
@@ -790,6 +846,83 @@ impl Store {
         out.push_str("END:VCALENDAR\r\n");
         fs::write(output, out)?;
         Ok(events.len())
+    }
+
+    fn import_rss(&mut self, book: &str, source: &str, limit: usize) -> anyhow::Result<usize> {
+        let bytes = fetch_feed(source)?;
+        self.import_feed_bytes(book, source, &bytes, limit)
+    }
+
+    fn import_feed_bytes(
+        &mut self,
+        book: &str,
+        source: &str,
+        bytes: &[u8],
+        limit: usize,
+    ) -> anyhow::Result<usize> {
+        let feed = feed_rs::parser::parse(bytes).context("parse RSS/Atom feed")?;
+        let feed_title = feed.title.as_ref().map(|title| title.content.clone());
+        let feed_url = source.to_string();
+        let mut count = 0;
+        for entry in feed.entries.into_iter().take(limit.max(1)) {
+            let link = entry.links.first().map(|link| link.href.clone());
+            let uid = if entry.id.trim().is_empty() {
+                link.clone().unwrap_or_default()
+            } else {
+                entry.id.clone()
+            };
+            if uid.is_empty() {
+                continue;
+            }
+            let entity_id = format!(
+                "feed-{}",
+                blake3::hash(format!("{feed_url}\0{uid}").as_bytes()).to_hex()
+            );
+            let authors: Vec<String> = entry
+                .authors
+                .iter()
+                .filter_map(|person| person.name.clone().or_else(|| person.email.clone()))
+                .collect();
+            let categories: Vec<String> = entry
+                .categories
+                .iter()
+                .map(|category| category.term.clone())
+                .filter(|term| !term.is_empty())
+                .collect();
+            let body = serde_json::json!({
+                "feed_url": feed_url,
+                "feed_title": feed_title,
+                "title": entry.title.as_ref().map(|title| title.content.clone()).unwrap_or_default(),
+                "link": link,
+                "summary": entry.summary.as_ref().map(|summary| summary.content.clone()).unwrap_or_default(),
+                "content": entry.content.as_ref().and_then(|content| content.body.clone()).unwrap_or_default(),
+                "authors": authors,
+                "categories": categories,
+                "published": entry.published.map(|date| date.to_rfc3339()),
+                "updated": entry.updated.map(|date| date.to_rfc3339()),
+                "uid": uid,
+            });
+            self.put_record(book, &entity_id, FEED_ITEM_SCHEMA, FEED_ITEM_VERSION, body)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn sync_feeds(&mut self, path: &Path) -> anyhow::Result<usize> {
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let config: FeedsConfig = toml::from_str(&text).context("parse feeds config")?;
+        let mut total = 0;
+        for feed in config.feeds {
+            let book = feed
+                .book
+                .or_else(|| config.default_book.clone())
+                .ok_or_else(|| anyhow!("feed {} has no book", feed.url))?;
+            let count = self.import_rss(&book, &feed.url, feed.limit)?;
+            let label = feed.title.as_deref().unwrap_or(&feed.url);
+            println!("{label}: {count} items -> {book}");
+            total += count;
+        }
+        Ok(total)
     }
 
     /// Page live records carrying one schema id.
@@ -1412,12 +1545,45 @@ fn unescape(value: &str) -> String {
     out
 }
 
+fn fetch_feed(source: &str) -> anyhow::Result<Vec<u8>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let response = ureq::get(source)
+            .timeout(FEED_TIMEOUT)
+            .call()
+            .with_context(|| format!("fetch {source}"))?;
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_FEED_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("read feed response")?;
+        if bytes.len() as u64 > MAX_FEED_BYTES {
+            bail!("feed exceeds {MAX_FEED_BYTES} bytes");
+        }
+        Ok(bytes)
+    } else {
+        let path = expand_home(source);
+        let metadata = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if metadata.len() > MAX_FEED_BYTES {
+            bail!("feed exceeds {MAX_FEED_BYTES} bytes");
+        }
+        fs::read(&path).with_context(|| format!("read {}", path.display()))
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn expand_home(value: &str) -> PathBuf {
     PathBuf::from(expand_home_string(value))
+}
+
+fn expand_home_path(value: &Path) -> PathBuf {
+    if value == Path::new("~") || value.starts_with("~/") {
+        return expand_home(&value.to_string_lossy());
+    }
+    value.to_path_buf()
 }
 
 fn expand_home_string(value: &str) -> String {
@@ -1797,6 +1963,41 @@ mod tests {
         assert!(exported.contains("BEGIN:VTIMEZONE"));
         assert!(exported.contains("SUMMARY:Design review"));
         assert!(exported.contains("SUMMARY:Holiday"));
+    }
+
+    #[test]
+    fn imports_rss_items_as_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        let rss = br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Feed</title>
+    <link>https://example.invalid/</link>
+    <description>Example</description>
+    <item>
+      <title>First post</title>
+      <link>https://example.invalid/first</link>
+      <guid>post-1</guid>
+      <pubDate>Tue, 05 Nov 2026 10:00:00 GMT</pubDate>
+      <description>Hello from RSS</description>
+    </item>
+  </channel>
+</rss>"#;
+        assert_eq!(
+            store
+                .import_feed_bytes("test/feeds", "https://example.invalid/feed.xml", rss, 10)
+                .unwrap(),
+            1
+        );
+        let records = store
+            .list_schema("test/feeds", FEED_ITEM_SCHEMA, 10)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fields["title"], "First post");
+        assert_eq!(records[0].fields["link"], "https://example.invalid/first");
+        assert_eq!(records[0].fields["summary"], "Hello from RSS");
+        assert_eq!(records[0].fields["feed_title"], "Example Feed");
     }
 
     #[test]

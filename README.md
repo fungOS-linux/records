@@ -15,6 +15,7 @@ encryption model.
 - macOS Contacts vCard import
 - vCard export
 - iCalendar import/export for events, with raw VEVENT/VTIMEZONE preservation
+- RSS/Atom ingest into searchable records from a host-side feed list
 - list/search/stat/vector/dump/apply
 - generic schema-tagged entries plus the built-in contacts schema
 - materialized changes and revision/origin merge
@@ -53,6 +54,43 @@ Export round-trips the stored raw event components:
 records --root ~/.local/share/fungos/records export-ics \
   --book personal/avery/calendar --output /tmp/calendar-out.ics
 ```
+
+## RSS and Atom
+
+Fetch one feed:
+
+```sh
+records --root ~/.local/share/fungos/records import-rss \
+  --book personal/avery/feeds \
+  --feed https://blog.rust-lang.org/feed.xml
+```
+
+Or keep the list in a dotfile and sync all of them:
+
+```sh
+records --root ~/.local/share/fungos/records sync-feeds \
+  --config ~/.config/fungos/feeds.toml
+```
+
+```toml
+default_book = "personal/avery/feeds"
+
+[[feeds]]
+url = "https://blog.rust-lang.org/feed.xml"
+title = "Rust Blog"
+limit = 100
+```
+
+Items use schema `fungos.feeds/item@1` with title, link, summary, content,
+authors, categories, published/updated timestamps, feed title, feed URL, and a
+stable UID. Re-importing updates the same record. Because feed items are normal
+records, they sync through the existing op log and are visible to
+`soil:records` and `soil:search`.
+
+Fetching is deliberately host-side. A Spore has no ambient network capability;
+a reader Spore should import `soil:records` for items and `soil:appdata` for its
+private display settings. The feed list above is host config, not AppData,
+because the host performs the fetch. See [`examples/feeds.toml`](examples/feeds.toml).
 
 ## Inspect
 

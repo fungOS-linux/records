@@ -13,10 +13,13 @@ anyhow = "1"
 blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
+feed-rs = "3"
 ical_vcard = "0.5"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
+ureq = "2"
 uuid = { version = "1", features = ["v4"] }
 unibus = { git = "https://github.com/fungOS-linux/unibus.git", rev = "89f7e5eda8426c13d6e7d71a433b0d82d2c37392" }
 
