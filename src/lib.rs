@@ -906,18 +906,6 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    fn get_optional(&self, book: &str, id: &str) -> anyhow::Result<Option<Record>> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
-                 FROM records WHERE book_id=?1 AND entity_id=?2",
-                params![book, id],
-                row_to_record,
-            )
-            .optional()?)
-    }
-
     fn import_vcf(&mut self, book: &str, file: &Path) -> anyhow::Result<usize> {
         let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
         let contacts = parse_vcards(&text)?;
@@ -1289,15 +1277,21 @@ impl Store {
     }
 
     pub fn get(&self, book: &str, id: &str) -> anyhow::Result<Record> {
-        self.db
+        self.get_optional(book, id)?
+            .ok_or_else(|| anyhow!("record not found: {id}"))
+    }
+
+    /// Read one record without treating absence as an error.
+    pub fn get_optional(&self, book: &str, id: &str) -> anyhow::Result<Option<Record>> {
+        Ok(self
+            .db
             .query_row(
                 "SELECT book_id,entity_id,schema_id,schema_version,revision,fields,updated_hlc,deleted,origin
                  FROM records WHERE book_id=?1 AND entity_id=?2",
                 params![book, id],
                 row_to_record,
             )
-            .optional()?
-            .ok_or_else(|| anyhow!("record not found: {id}"))
+            .optional()?)
     }
 
     pub fn vector(&self, book: &str) -> anyhow::Result<Vector> {
